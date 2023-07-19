@@ -34,7 +34,6 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
             "ExtendedBallot(uint256 proposalId,uint8 support,address voter,uint256 nonce,string reason,bytes params)"
         );
 
-    // solhint-disable var-name-mixedcase
     struct ProposalCore {
         address proposer;
         uint48 voteStart;
@@ -42,12 +41,15 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
         bool executed;
         bool canceled;
     }
-    // solhint-enable var-name-mixedcase
+    struct ProposalExtra {
+        uint48 eta;
+    }
 
     bytes32 private constant _ALL_PROPOSAL_STATES_BITMAP = bytes32((2 ** (uint8(type(ProposalState).max) + 1)) - 1);
     string private _name;
 
     mapping(uint256 => ProposalCore) private _proposals;
+    mapping(uint256 => ProposalExtra) private _proposalsExtra;
 
     // This queue keeps track of the governor operating on itself. Calls to functions protected by the
     // {onlyGovernance} modifier needs to be whitelisted in this queue. Whitelisting is set in {_beforeExecute},
@@ -97,27 +99,8 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
      * @dev See {IERC165-supportsInterface}.
      */
     function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165, ERC165) returns (bool) {
-        bytes4 governorCancelId = this.cancel.selector ^ this.proposalProposer.selector;
-
-        bytes4 governorParamsId = this.castVoteWithReasonAndParams.selector ^
-            this.castVoteWithReasonAndParamsBySig.selector ^
-            this.getVotesWithParams.selector;
-
-        // The original interface id in v4.3.
-        bytes4 governor43Id = type(IGovernor).interfaceId ^
-            type(IERC6372).interfaceId ^
-            governorCancelId ^
-            governorParamsId;
-
-        // An updated interface id in v4.6, with params added.
-        bytes4 governor46Id = type(IGovernor).interfaceId ^ type(IERC6372).interfaceId ^ governorCancelId;
-
-        // For the updated interface id in v4.9, we use governorCancelId directly.
-
         return
-            interfaceId == governor43Id ||
-            interfaceId == governor46Id ||
-            interfaceId == governorCancelId ||
+            interfaceId == type(IGovernor).interfaceId ||
             interfaceId == type(IERC1155Receiver).interfaceId ||
             super.supportsInterface(interfaceId);
     }
@@ -168,9 +151,7 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
 
         if (proposal.executed) {
             return ProposalState.Executed;
-        }
-
-        if (proposal.canceled) {
+        } else if (proposal.canceled) {
             return ProposalState.Canceled;
         }
 
@@ -190,12 +171,12 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
 
         if (deadline >= currentTimepoint) {
             return ProposalState.Active;
-        }
-
-        if (_quorumReached(proposalId) && _voteSucceeded(proposalId)) {
+        } else if (!_quorumReached(proposalId) || !_voteSucceeded(proposalId)) {
+            return ProposalState.Defeated;
+        } else if (proposalEta(proposalId) == 0) {
             return ProposalState.Succeeded;
         } else {
-            return ProposalState.Defeated;
+            return ProposalState.Queued;
         }
     }
 
@@ -225,6 +206,13 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
      */
     function proposalProposer(uint256 proposalId) public view virtual override returns (address) {
         return _proposals[proposalId].proposer;
+    }
+
+    /**
+     * @dev Public accessor to check the eta of a queued proposal
+     */
+    function proposalEta(uint256 proposalId) public view virtual override returns (uint256) {
+        return _proposalsExtra[proposalId].eta;
     }
 
     /**
@@ -275,21 +263,37 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
         string memory description
     ) public virtual override returns (uint256) {
         address proposer = _msgSender();
+
+        // check: description restriction
         require(_isValidDescriptionForProposer(proposer, description), "Governor: proposer restricted");
 
-        uint256 currentTimepoint = clock();
-
-        // Avoid stack too deep
-        {
-            uint256 proposerVotes = getVotes(proposer, currentTimepoint - 1);
-            uint256 votesThreshold = proposalThreshold();
-            if (proposerVotes < votesThreshold) {
-                revert GovernorInsufficientProposerVotes(proposer, proposerVotes, votesThreshold);
-            }
+        // check proposal threshold
+        uint256 proposerVotes = getVotes(proposer, clock() - 1);
+        uint256 votesThreshold = proposalThreshold();
+        if (proposerVotes < votesThreshold) {
+            revert GovernorInsufficientProposerVotes(proposer, proposerVotes, votesThreshold);
         }
 
         uint256 proposalId = hashProposal(targets, values, calldatas, keccak256(bytes(description)));
 
+        _propose(proposalId, targets, values, calldatas, description, proposer);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Internal propose mechanism. Can be overridden to add more logic on proposal creation.
+     *
+     * Emits a {IGovernor-ProposalCreated} event.
+     */
+    function _propose(
+        uint256 proposalId,
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description,
+        address proposer
+    ) internal virtual {
         if (targets.length != values.length || targets.length != calldatas.length || targets.length == 0) {
             revert GovernorInvalidProposalLength(targets.length, calldatas.length, values.length);
         }
@@ -297,7 +301,7 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
             revert GovernorUnexpectedProposalState(proposalId, state(proposalId), bytes32(0));
         }
 
-        uint256 snapshot = currentTimepoint + votingDelay();
+        uint256 snapshot = clock() + votingDelay();
         uint256 duration = votingPeriod();
 
         _proposals[proposalId] = ProposalCore({
@@ -319,8 +323,70 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
             snapshot + duration,
             description
         );
+    }
+
+    /**
+     * @dev See {IGovernor-queue}.
+     */
+    function queue(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public virtual override returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+
+        _queue(proposalId, targets, values, calldatas, descriptionHash);
 
         return proposalId;
+    }
+
+    /**
+     * @dev Internal queuing mechanism. Can be overridden (with a super call) to add logic before or after the
+     * queuing.
+     *
+     * Emits a {IGovernor-ProposalQueued} event if the eta is not 0.
+     */
+    function _queue(
+        uint256 proposalId,
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual {
+        _validateStateBitmap(proposalId, _encodeStateBitmap(ProposalState.Succeeded));
+
+        (bool implemented, uint48 eta) = _queueCalls(proposalId, targets, values, calldatas, descriptionHash);
+
+        if (implemented) {
+            _proposalsExtra[proposalId].eta = eta;
+            emit ProposalQueued(proposalId, eta);
+        } else {
+            revert GovernorQueueNotImplemented();
+        }
+    }
+
+    /**
+     * @dev Internal queuing mechanism. Can be overridden (without a super call) to modify the way queuing is
+     * performed (for example adding a vault/timelock).
+     *
+     * This is empty by default, and must be overridden to implement queuing.
+     *
+     * This function returns a boolean and a timestamp that describes the expected eta for execution. If the returned
+     * boolean is false (which is the default value), the core will consider queueing to not be implemented, and the
+     * public {queue} function will revert.
+     *
+     * NOTE: Calling this function directly will NOT check the current state of the proposal, or emit the
+     * `ProposalQueued` event. Queuing a proposal should be done using {queue} or {_queue}.
+     */
+    function _queueCalls(
+        uint256 /*proposalId*/,
+        address[] memory /*targets*/,
+        uint256[] memory /*values*/,
+        bytes[] memory /*calldatas*/,
+        bytes32 /*descriptionHash*/
+    ) internal virtual returns (bool, uint48) {
+        return (false, 0);
     }
 
     /**
@@ -334,49 +400,61 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
     ) public payable virtual override returns (uint256) {
         uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
 
-        ProposalState currentState = state(proposalId);
-        if (currentState != ProposalState.Succeeded && currentState != ProposalState.Queued) {
-            revert GovernorUnexpectedProposalState(
-                proposalId,
-                currentState,
-                _encodeStateBitmap(ProposalState.Succeeded) | _encodeStateBitmap(ProposalState.Queued)
-            );
-        }
-        _proposals[proposalId].executed = true;
-
-        emit ProposalExecuted(proposalId);
-
-        _beforeExecute(proposalId, targets, values, calldatas, descriptionHash);
         _execute(proposalId, targets, values, calldatas, descriptionHash);
-        _afterExecute(proposalId, targets, values, calldatas, descriptionHash);
 
         return proposalId;
     }
 
     /**
-     * @dev See {IGovernor-cancel}.
+     * @dev Internal execution mechanism. Can be overridden (with a super call) to add logic before or after the
+     * execution.
+     *
+     * Emits a {IGovernor-ProposalExecuted} event.
      */
-    function cancel(
+    function _execute(
+        uint256 proposalId,
         address[] memory targets,
         uint256[] memory values,
         bytes[] memory calldatas,
         bytes32 descriptionHash
-    ) public virtual override returns (uint256) {
-        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
-        ProposalState currentState = state(proposalId);
-        if (currentState != ProposalState.Pending) {
-            revert GovernorUnexpectedProposalState(proposalId, currentState, _encodeStateBitmap(ProposalState.Pending));
+    ) internal virtual {
+        _validateStateBitmap(
+            proposalId,
+            _encodeStateBitmap(ProposalState.Succeeded) | _encodeStateBitmap(ProposalState.Queued)
+        );
+
+        // mark as executed before calls to avoid reentrancy
+        _proposals[proposalId].executed = true;
+
+        // before execute: register governance call in queue.
+        if (_executor() != address(this)) {
+            for (uint256 i = 0; i < targets.length; ++i) {
+                if (targets[i] == address(this)) {
+                    _governanceCall.pushBack(keccak256(calldatas[i]));
+                }
+            }
         }
-        if (_msgSender() != proposalProposer(proposalId)) {
-            revert GovernorOnlyProposer(_msgSender());
+
+        _executeCalls(proposalId, targets, values, calldatas, descriptionHash);
+
+        // after execute: cleanup governance call queue.
+        if (_executor() != address(this)) {
+            if (!_governanceCall.empty()) {
+                _governanceCall.clear();
+            }
         }
-        return _cancel(targets, values, calldatas, descriptionHash);
+
+        emit ProposalExecuted(proposalId);
     }
 
     /**
-     * @dev Internal execution mechanism. Can be overridden to implement different execution mechanism
+     * @dev Internal execution mechanism. Can be overridden (without a super call) to modify the way execution is
+     * performed (for example adding a vault/timelock).
+     *
+     * NOTE: Calling this function directly will NOT check the current state of the proposal, set the executed flag to
+     * true or emit the `ProposalExecuted` event. Executing a proposal should be done using {execute} or {_execute}.
      */
-    function _execute(
+    function _executeCalls(
         uint256 /* proposalId */,
         address[] memory targets,
         uint256[] memory values,
@@ -390,39 +468,25 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
     }
 
     /**
-     * @dev Hook before execution is triggered.
+     * @dev See {IGovernor-cancel}.
      */
-    function _beforeExecute(
-        uint256 /* proposalId */,
+    function cancel(
         address[] memory targets,
-        uint256[] memory /* values */,
+        uint256[] memory values,
         bytes[] memory calldatas,
-        bytes32 /*descriptionHash*/
-    ) internal virtual {
-        if (_executor() != address(this)) {
-            for (uint256 i = 0; i < targets.length; ++i) {
-                if (targets[i] == address(this)) {
-                    _governanceCall.pushBack(keccak256(calldatas[i]));
-                }
-            }
-        }
-    }
+        bytes32 descriptionHash
+    ) public virtual override returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
 
-    /**
-     * @dev Hook after execution is triggered.
-     */
-    function _afterExecute(
-        uint256 /* proposalId */,
-        address[] memory /* targets */,
-        uint256[] memory /* values */,
-        bytes[] memory /* calldatas */,
-        bytes32 /*descriptionHash*/
-    ) internal virtual {
-        if (_executor() != address(this)) {
-            if (!_governanceCall.empty()) {
-                _governanceCall.clear();
-            }
+        // public cancel restrictions (on top of existing _cancel restrictions).
+        _validateStateBitmap(proposalId, _encodeStateBitmap(ProposalState.Pending));
+        if (_msgSender() != proposalProposer(proposalId)) {
+            revert GovernorOnlyProposer(_msgSender());
         }
+
+        _cancel(proposalId, targets, values, calldatas, descriptionHash);
+
+        return proposalId;
     }
 
     /**
@@ -432,30 +496,22 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
      * Emits a {IGovernor-ProposalCanceled} event.
      */
     function _cancel(
-        address[] memory targets,
-        uint256[] memory values,
-        bytes[] memory calldatas,
-        bytes32 descriptionHash
-    ) internal virtual returns (uint256) {
-        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+        uint256 proposalId,
+        address[] memory /*targets*/,
+        uint256[] memory /*values*/,
+        bytes[] memory /*calldatas*/,
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        _validateStateBitmap(
+            proposalId,
+            _ALL_PROPOSAL_STATES_BITMAP ^
+                _encodeStateBitmap(ProposalState.Canceled) ^
+                _encodeStateBitmap(ProposalState.Expired) ^
+                _encodeStateBitmap(ProposalState.Executed)
+        );
 
-        ProposalState currentState = state(proposalId);
-
-        bytes32 forbiddenStates = _encodeStateBitmap(ProposalState.Canceled) |
-            _encodeStateBitmap(ProposalState.Expired) |
-            _encodeStateBitmap(ProposalState.Executed);
-        if (forbiddenStates & _encodeStateBitmap(currentState) != 0) {
-            revert GovernorUnexpectedProposalState(
-                proposalId,
-                currentState,
-                _ALL_PROPOSAL_STATES_BITMAP ^ forbiddenStates
-            );
-        }
         _proposals[proposalId].canceled = true;
-
         emit ProposalCanceled(proposalId);
-
-        return proposalId;
     }
 
     /**
@@ -684,6 +740,20 @@ abstract contract Governor is Context, ERC165, EIP712, Nonces, IGovernor, IERC72
      */
     function _encodeStateBitmap(ProposalState proposalState) internal pure returns (bytes32) {
         return bytes32(1 << uint8(proposalState));
+    }
+
+    /**
+     * @dev Check that the current state of a proposal matches the requirements described by the `allowedStates` bitmap.
+     * This bitmap should be built using `_encodeStateBitmap`.
+     *
+     * If requirements are not met, revert with an `GovernorUnexpectedProposalState` error.
+     */
+    function _validateStateBitmap(uint256 proposalId, bytes32 allowedStates) private view returns (ProposalState) {
+        ProposalState currentState = state(proposalId);
+        if (_encodeStateBitmap(currentState) & allowedStates == bytes32(0)) {
+            revert GovernorUnexpectedProposalState(proposalId, currentState, allowedStates);
+        }
+        return currentState;
     }
 
     /*

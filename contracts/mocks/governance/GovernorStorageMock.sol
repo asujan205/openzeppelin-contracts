@@ -7,12 +7,14 @@ import {GovernorTimelockControl} from "../../governance/extensions/GovernorTimel
 import {GovernorSettings} from "../../governance/extensions/GovernorSettings.sol";
 import {GovernorCountingSimple} from "../../governance/extensions/GovernorCountingSimple.sol";
 import {GovernorVotesQuorumFraction} from "../../governance/extensions/GovernorVotesQuorumFraction.sol";
+import {GovernorStorage} from "../../governance/extensions/GovernorStorage.sol";
 
-abstract contract GovernorTimelockControlMock is
+abstract contract GovernorStorageMock is
     GovernorSettings,
     GovernorTimelockControl,
     GovernorVotesQuorumFraction,
-    GovernorCountingSimple
+    GovernorCountingSimple,
+    GovernorStorage
 {
     function quorum(
         uint256 blockNumber
@@ -26,6 +28,17 @@ abstract contract GovernorTimelockControlMock is
 
     function proposalThreshold() public view override(Governor, GovernorSettings) returns (uint256) {
         return super.proposalThreshold();
+    }
+
+    function _propose(
+        uint256 proposalId,
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description,
+        address proposer
+    ) internal virtual override(Governor, GovernorStorage) {
+        super._propose(proposalId, targets, values, calldatas, description, proposer);
     }
 
     function _queueCalls(
@@ -61,6 +74,4 @@ abstract contract GovernorTimelockControlMock is
     function _executor() internal view override(Governor, GovernorTimelockControl) returns (address) {
         return super._executor();
     }
-
-    function nonGovernanceFunction() external {}
 }

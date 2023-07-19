@@ -14,12 +14,6 @@ abstract contract GovernorTimelockCompoundMock is
     GovernorVotesQuorumFraction,
     GovernorCountingSimple
 {
-    function supportsInterface(
-        bytes4 interfaceId
-    ) public view override(Governor, GovernorTimelockCompound) returns (bool) {
-        return super.supportsInterface(interfaceId);
-    }
-
     function quorum(
         uint256 blockNumber
     ) public view override(IGovernor, GovernorVotesQuorumFraction) returns (uint256) {
@@ -36,23 +30,34 @@ abstract contract GovernorTimelockCompoundMock is
         return super.proposalThreshold();
     }
 
-    function _execute(
+    function _queueCalls(
+        uint256 proposalId,
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal override(Governor, GovernorTimelockCompound) returns (bool, uint48) {
+        return super._queueCalls(proposalId, targets, values, calldatas, descriptionHash);
+    }
+
+    function _executeCalls(
         uint256 proposalId,
         address[] memory targets,
         uint256[] memory values,
         bytes[] memory calldatas,
         bytes32 descriptionHash
     ) internal override(Governor, GovernorTimelockCompound) {
-        super._execute(proposalId, targets, values, calldatas, descriptionHash);
+        super._executeCalls(proposalId, targets, values, calldatas, descriptionHash);
     }
 
     function _cancel(
+        uint256 proposalId,
         address[] memory targets,
         uint256[] memory values,
         bytes[] memory calldatas,
-        bytes32 salt
-    ) internal override(Governor, GovernorTimelockCompound) returns (uint256 proposalId) {
-        return super._cancel(targets, values, calldatas, salt);
+        bytes32 descriptionHash
+    ) internal override(Governor, GovernorTimelockCompound) {
+        return super._cancel(proposalId, targets, values, calldatas, descriptionHash);
     }
 
     function _executor() internal view override(Governor, GovernorTimelockCompound) returns (address) {
