@@ -1,6 +1,10 @@
 # Changelog
 
 
+## 4.9.3 (2023-07-25)
+
+- `ERC2771Context`: Return the forwarder address whenever the `msg.data` of a call originating from a trusted forwarder is not long enough to contain the request signer address (i.e. `msg.data.length` is less than 20 bytes), as specified by ERC-2771.
+
 ## 4.9.2 (2023-06-16)
 
 - `MerkleProof`: Fix a bug in `processMultiProof` and `processMultiProofCalldata` that allows proving arbitrary leaves if the tree contains a node with value 0 at depth 1.
